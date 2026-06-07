@@ -1,5 +1,4 @@
-const https = require('https');
-const http = require('http');
+const Anthropic = require('@anthropic-ai/sdk');
 const { EventEmitter } = require('events');
 const { TOOL_DEFINITIONS, TOOL_EXECUTORS, WORKSPACE_ROOT } = require('./tools');
 
@@ -25,27 +24,28 @@ class Agent extends EventEmitter {
     this.maxTokens = options.maxTokens || MAX_TOKENS;
     this.systemPrompt = options.systemPrompt || SYSTEM_PROMPT;
     this.tools = options.tools || TOOL_DEFINITIONS;
-    this.withTools = options.withTools !== false; // default: use tools
+    this.withTools = options.withTools !== false;
+
     this._stopped = false;
-    this._currentReq = null; // Reference to current HTTP request for abort
+    this._stream = null; // Reference to SDK MessageStream for abort
+
+    // SDK client — created once per agent instance
+    this._client = new Anthropic({
+      apiKey: API_TOKEN,
+      baseURL: API_BASE,
+    });
   }
 
   stop() {
     this._stopped = true;
-    if (this._currentReq) {
-      try { this._currentReq.destroy(); } catch {}
-      this._currentReq = null;
+    if (this._stream) {
+      try { this._stream.abort(); } catch {}
+      this._stream = null;
     }
   }
 
   _isAborted() {
     return this._stopped;
-  }
-
-  _checkAborted() {
-    if (this._stopped) {
-      throw { name: 'AbortError', message: 'Agent was stopped' };
-    }
   }
 
   async run(messages) {
@@ -80,6 +80,7 @@ class Agent extends EventEmitter {
           return messages;
         }
 
+        // Execute tools and feed results back
         const toolResults = [];
         for (const tool of result.toolUses) {
           if (this._isAborted()) throw { name: 'AbortError' };
@@ -129,270 +130,153 @@ class Agent extends EventEmitter {
       this.emit('agent_error', { message: err.message });
       return messages;
     } finally {
-      this._currentReq = null;
+      this._stream = null;
     }
   }
 
-  // Streaming call — emits events AND returns full tool_use blocks
+  // ── Streaming call using SDK MessageStream ──
   _streamCall(messages, useTools) {
-    const url = new URL(API_BASE);
-    const isHttps = url.protocol === 'https:';
-    const client = isHttps ? https : http;
-    const apiPath = url.pathname.replace(/\/$/, '') + '/v1/messages';
-
-    const bodyObj = {
+    const params = {
       model: this.model,
       max_tokens: this.maxTokens,
-      stream: true,
       system: this.systemPrompt,
-      messages
+      messages,
     };
     if (useTools) {
-      bodyObj.tools = this.tools;
+      params.tools = this.tools;
     }
 
-    const body = JSON.stringify(bodyObj);
-
-    const options = {
-      hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
-      path: apiPath,
-      method: 'POST',
-      headers: {
-        'x-api-key': API_TOKEN,
-        'anthropic-version': '2023-06-01',
-        'content-type': 'application/json',
-        'accept': 'text/event-stream'
-      },
-    };
-
     return new Promise((resolve, reject) => {
-      const req = client.request(options, (res) => {
-        this._currentReq = req;
-        if (res.statusCode >= 400) {
-          let errBody = '';
-          res.on('data', chunk => errBody += chunk);
-          res.on('end', () => {
-            let msg = `API error ${res.statusCode}`;
-            try {
-              const parsed = JSON.parse(errBody);
-              msg = parsed.error?.message || msg;
-              // Detect if tools aren't supported
-              if (msg.includes('tool') || msg.includes('function')) {
-                reject(Object.assign(new Error(msg), { code: 'TOOLS_NOT_SUPPORTED' }));
-                return;
+      const stream = this._client.messages.stream(params);
+      this._stream = stream; // store for abort
+
+      const allBlocks = [];
+      let havingThinking = false;
+      let stopReason = null;
+      let usage = null;
+
+      stream.on('streamEvent', (event) => {
+        switch (event.type) {
+          case 'message_start':
+            usage = event.message?.usage;
+            break;
+
+          case 'content_block_start': {
+            const block = event.content_block;
+            const entry = { index: event.index, type: block.type };
+            if (block.type === 'tool_use') {
+              entry.id = block.id;
+              entry.name = block.name;
+              entry.input_json_str = '';
+            } else if (block.type === 'thinking') {
+              havingThinking = true;
+            } else if (block.type === 'text') {
+              entry.text = block.text || '';
+            }
+            allBlocks.push(entry);
+            break;
+          }
+
+          case 'content_block_delta': {
+            const idx = event.index;
+            const block = allBlocks.find(b => b.index === idx);
+            if (!block) break;
+
+            if (event.delta.type === 'text_delta') {
+              block.text = (block.text || '') + event.delta.text;
+              this.emit('text_delta', { text: event.delta.text });
+            } else if (event.delta.type === 'input_json_delta') {
+              block.input_json_str = (block.input_json_str || '') + event.delta.partial_json;
+            } else if (event.delta.type === 'thinking_delta') {
+              this.emit('thinking_delta', { text: event.delta.thinking });
+            }
+            break;
+          }
+
+          case 'content_block_stop': {
+            const endedBlock = allBlocks.find(b => b.index === event.index);
+            if (endedBlock) {
+              if (endedBlock.type === 'thinking' && havingThinking) {
+                havingThinking = false;
+                this.emit('thinking_done', {});
+              } else if (endedBlock.type === 'tool_use') {
+                let input = {};
+                try { input = JSON.parse(endedBlock.input_json_str || '{}'); } catch {}
+                this.emit('tool_call', { id: endedBlock.id, name: endedBlock.name, input });
               }
-            } catch {}
-            reject(new Error(msg));
-          });
-          return;
+            }
+            break;
+          }
+
+          case 'message_delta':
+            stopReason = event.delta?.stop_reason;
+            usage = event.usage || usage;
+            break;
+
+          case 'message_stop':
+            break;
         }
-
-        let buffer = '';
-        let currentData = '';
-        let currentBlockIdx = -1;
-        let currentBlockType = null;
-
-        // Accumulated state
-        const allBlocks = []; // { type, id?, name?, input_json_str?, text? }
-        let havingThinking = false;
-        let stopReason = null;
-        let usage = null;
-
-        const flushEvent = () => {
-          if (!currentData) return;
-          try {
-            const event = JSON.parse(currentData);
-            processEvent(event);
-          } catch {}
-          currentData = '';
-        };
-
-        const processEvent = (event) => {
-          switch (event.type) {
-            case 'message_start':
-              usage = event.message?.usage;
-              break;
-
-            case 'content_block_start': {
-              const block = event.content_block;
-              currentBlockIdx = event.index;
-              currentBlockType = block.type;
-              const entry = { index: event.index, type: block.type };
-
-              if (block.type === 'tool_use') {
-                entry.id = block.id;
-                entry.name = block.name;
-                entry.input_json_str = '';
-                // Defer tool_call emission until content_block_stop when input is complete
-              } else if (block.type === 'thinking') {
-                havingThinking = true;
-              } else if (block.type === 'text') {
-                entry.text = block.text || '';
-              }
-              allBlocks.push(entry);
-              break;
-            }
-
-            case 'content_block_delta': {
-              const idx = event.index;
-              const block = allBlocks.find(b => b.index === idx);
-              if (!block) break;
-
-              if (event.delta.type === 'text_delta') {
-                block.text = (block.text || '') + event.delta.text;
-                this.emit('text_delta', { text: event.delta.text });
-              } else if (event.delta.type === 'input_json_delta') {
-                block.input_json_str = (block.input_json_str || '') + event.delta.partial_json;
-              } else if (event.delta.type === 'thinking_delta') {
-                this.emit('thinking_delta', { text: event.delta.thinking });
-              }
-              break;
-            }
-
-            case 'content_block_stop': {
-              const endedBlock = allBlocks.find(b => b.index === event.index);
-              if (endedBlock) {
-                if (endedBlock.type === 'thinking' && havingThinking) {
-                  havingThinking = false;
-                  this.emit('thinking_done', {});
-                } else if (endedBlock.type === 'tool_use') {
-                  // Input JSON is now complete, parse and emit
-                  let input = {};
-                  try { input = JSON.parse(endedBlock.input_json_str || '{}'); } catch {}
-                  this.emit('tool_call', { id: endedBlock.id, name: endedBlock.name, input });
-                }
-              }
-              break;
-            }
-
-            case 'message_delta':
-              stopReason = event.delta?.stop_reason;
-              usage = event.usage || usage;
-              break;
-
-            case 'message_stop':
-              break;
-          }
-        };
-
-        res.on('data', (chunk) => {
-          buffer += chunk.toString();
-          // Process complete SSE events (separated by \n\n)
-          const parts = buffer.split('\n\n');
-          buffer = parts.pop(); // Keep incomplete part
-          for (const part of parts) {
-            const lines = part.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                currentData += line.slice(6);
-              }
-            }
-            flushEvent();
-          }
-        });
-
-        res.on('end', () => {
-          // Process remaining
-          if (buffer.trim()) {
-            const lines = buffer.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('data: ')) {
-                currentData += line.slice(6);
-              }
-            }
-            flushEvent();
-          }
-
-          // Build assistant content from accumulated blocks
-          const assistantContent = [];
-          const toolUses = [];
-
-          for (const block of allBlocks) {
-            if (block.type === 'text' && block.text) {
-              assistantContent.push({ type: 'text', text: block.text });
-            } else if (block.type === 'tool_use') {
-              let input = {};
-              try {
-                input = JSON.parse(block.input_json_str || '{}');
-              } catch {}
-              assistantContent.push({
-                type: 'tool_use',
-                id: block.id,
-                name: block.name,
-                input
-              });
-              toolUses.push({ id: block.id, name: block.name, input });
-            }
-          }
-
-          if (assistantContent.length === 0 && stopReason === 'end_turn') {
-            // Empty response
-            assistantContent.push({ type: 'text', text: '' });
-          }
-
-          messages.push({ role: 'assistant', content: assistantContent });
-
-          if (toolUses.length > 0) {
-            resolve({ done: false, toolUses });
-          } else {
-            this.emit('text_done', {});
-            resolve({ done: true, usage, stopReason });
-          }
-        });
-
-        res.on('error', reject);
       });
 
-      req.on('error', reject);
-      req.write(body);
-      req.end();
+      stream.on('error', (error) => {
+        // Detect tools-not-supported errors
+        const msg = error.message || '';
+        if (msg.includes('tool') || msg.includes('function')) {
+          reject(Object.assign(new Error(msg), { code: 'TOOLS_NOT_SUPPORTED' }));
+          return;
+        }
+        reject(error);
+      });
+
+      stream.on('abort', () => {
+        // Stream was aborted via stop() — handled by run() loop
+      });
+
+      stream.on('end', () => {
+        // Build assistant content from accumulated blocks
+        const assistantContent = [];
+        const toolUses = [];
+
+        for (const block of allBlocks) {
+          if (block.type === 'text' && block.text) {
+            assistantContent.push({ type: 'text', text: block.text });
+          } else if (block.type === 'tool_use') {
+            let input = {};
+            try { input = JSON.parse(block.input_json_str || '{}'); } catch {}
+            assistantContent.push({ type: 'tool_use', id: block.id, name: block.name, input });
+            toolUses.push({ id: block.id, name: block.name, input });
+          }
+        }
+
+        if (assistantContent.length === 0 && stopReason === 'end_turn') {
+          assistantContent.push({ type: 'text', text: '' });
+        }
+
+        messages.push({ role: 'assistant', content: assistantContent });
+
+        if (toolUses.length > 0) {
+          resolve({ done: false, toolUses });
+        } else {
+          this.emit('text_done', {});
+          resolve({ done: true, usage, stopReason });
+        }
+      });
     });
   }
 
-  // Simple non-streaming for basic chat (no tools)
+  // ── Non-streaming chat (no tools) using SDK ──
   async chat(messages) {
-    const url = new URL(API_BASE);
-    const isHttps = url.protocol === 'https:';
-    const client = isHttps ? https : http;
-    const apiPath = url.pathname.replace(/\/$/, '') + '/v1/messages';
-
-    return new Promise((resolve, reject) => {
-      const req = client.request({
-        hostname: url.hostname,
-        port: url.port || (isHttps ? 443 : 80),
-        path: apiPath,
-        method: 'POST',
-        headers: {
-          'x-api-key': API_TOKEN,
-          'anthropic-version': '2023-06-01',
-          'content-type': 'application/json'
-        }
-      }, (res) => {
-        let body = '';
-        res.on('data', chunk => body += chunk);
-        res.on('end', () => {
-          if (res.statusCode >= 400) {
-            try {
-              const err = JSON.parse(body);
-              reject(new Error(err.error?.message || `API error ${res.statusCode}`));
-            } catch { reject(new Error(`API error ${res.statusCode}: ${body}`)); }
-            return;
-          }
-          try {
-            resolve(JSON.parse(body));
-          } catch { reject(new Error(`Parse error: ${body}`)); }
-        });
-      });
-      req.on('error', reject);
-      req.write(JSON.stringify({
+    try {
+      const response = await this._client.messages.create({
         model: this.model,
         max_tokens: this.maxTokens,
         system: this.systemPrompt,
-        messages
-      }));
-      req.end();
-    });
+        messages,
+      });
+      return response;
+    } catch (err) {
+      throw new Error(err.message || 'API error');
+    }
   }
 }
 

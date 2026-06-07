@@ -338,6 +338,34 @@ html, body {
 .msg-assistant-content th { background: var(--bg-tertiary); font-weight: 600; }
 
 /* Code blocks */
+.code-block-wrapper {
+  margin: 12px 0;
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.08);
+}
+.code-block-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 6px 12px;
+  background: #2A2A2A;
+  font-size: 11px; font-weight: 500;
+  color: #999;
+  font-family: var(--font-sans);
+}
+.code-lang-label { text-transform: lowercase; }
+.code-block-wrapper pre {
+  background: var(--code-bg);
+  border-radius: 0;
+  padding: 12px 16px;
+  overflow-x: auto;
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.code-block-wrapper pre code {
+  font-family: var(--font-mono);
+  color: #E2E8F0;
+}
 .msg-assistant-content pre {
   background: var(--code-bg);
   border-radius: var(--radius-sm);
@@ -346,12 +374,10 @@ html, body {
   margin: 12px 0;
   font-size: 13px;
   line-height: 1.5;
-  position: relative;
 }
 .msg-assistant-content pre code {
   font-family: var(--font-mono);
   color: #E2E8F0;
-  padding-right: 28px;
 }
 .msg-assistant-content code {
   font-family: var(--font-mono);
@@ -361,26 +387,24 @@ html, body {
   border-radius: 3px;
 }
 .msg-assistant-content pre code {
-  background: none; padding: 0; padding-right: 28px;
+  background: none; padding: 0;
 }
 
 .code-copy-btn {
-  position: absolute;
-  top: 8px; right: 8px;
-  background: rgba(255,255,255,0.1);
-  border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 4px;
-  color: #aaa;
+  background: none;
+  border: none;
+  color: #999;
   cursor: pointer;
   font-size: 11px;
-  padding: 3px 8px;
+  padding: 2px 6px;
+  border-radius: 3px;
   font-family: var(--font-sans);
   transition: all 0.15s;
   opacity: 0;
 }
-.msg-assistant-content pre:hover .code-copy-btn { opacity: 1; }
-.code-copy-btn:hover { background: rgba(255,255,255,0.2); color: #fff; }
-.code-copy-btn.copied { color: #10B981; border-color: #10B981; }
+.code-block-wrapper:hover .code-copy-btn { opacity: 1; }
+.code-copy-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.code-copy-btn.copied { color: #10B981; }
 
 /* ========== Input Area ========== */
 .input-area {
@@ -564,6 +588,7 @@ let currentTurn = null; // Being built during streaming
 let isDark = false;
 let currentThinkingStart = null; // timestamp when current thinking block started
 let currentThinkingBlockEl = null; // reference to current thinking block DOM element
+let markdownRenderTimer = null; // debounce timer for incremental markdown rendering
 
 // DOM refs
 const messagesInner = document.getElementById('messagesInner');
@@ -820,7 +845,7 @@ function appendAssistantBlocks(blocks) {
   messagesInner.appendChild(div);
   renderMath(div);
   const content = div.querySelector('.msg-assistant-content');
-  if (content) addCodeCopyButtons(content);
+  if (content) enhanceCodeBlocks(content);
   scrollBottom();
   return div;
 }
@@ -970,47 +995,80 @@ function handleStreamEvent(eventType, data) {
     case 'text_delta': {
       const div = getOrCreateAssistantDiv();
       currentTurn.text += data.text;
-      let tc = div.querySelector('.msg-assistant-content');
-      if (!tc) {
-        tc = document.createElement('div');
-        tc.className = 'msg-assistant-content';
-        div.appendChild(tc);
-      }
-      tc.innerHTML = renderMarkdown(currentTurn.text);
-      renderMath(tc);
-      addCodeCopyButtons(tc);
+      // Debounce: re-render at most every 80ms instead of on every delta
+      if (markdownRenderTimer) clearTimeout(markdownRenderTimer);
+      markdownRenderTimer = setTimeout(() => {
+        markdownRenderTimer = null;
+        let tc = div.querySelector('.msg-assistant-content');
+        if (!tc) {
+          tc = document.createElement('div');
+          tc.className = 'msg-assistant-content';
+          div.appendChild(tc);
+        }
+        tc.innerHTML = renderMarkdown(currentTurn.text);
+        renderMath(tc);
+        enhanceCodeBlocks(tc);
+      }, 80);
       scrollBottom();
       break;
     }
 
     case 'text_done': {
-      const div = document.getElementById('active-turn');
-      if (div) {
+      // Flush any pending debounced render
+      if (markdownRenderTimer) {
+        clearTimeout(markdownRenderTimer);
+        markdownRenderTimer = null;
+        const div = document.getElementById('active-turn');
+        if (div) {
+          let tc = div.querySelector('.msg-assistant-content');
+          if (tc && currentTurn?.text) {
+            tc.innerHTML = renderMarkdown(currentTurn.text);
+            renderMath(tc);
+            enhanceCodeBlocks(tc);
+          }
+        }
+      }
+      const doneDiv = document.getElementById('active-turn');
+      if (doneDiv) {
         // Add action bar
-        const actions = div.querySelector('.msg-actions');
+        const actions = doneDiv.querySelector('.msg-actions');
         if (!actions) {
           const act = document.createElement('div');
           act.className = 'msg-actions';
           act.innerHTML = '<button class="msg-action-btn" onclick="copyText(this)">Copy</button>';
-          div.appendChild(act);
+          doneDiv.appendChild(act);
         }
+        const content = doneDiv.querySelector('.msg-assistant-content');
+        if (content) enhanceCodeBlocks(content);
       }
       break;
     }
 
-    case 'agent_error':
+    case 'agent_error': {
+      // Flush pending render
+      if (markdownRenderTimer) {
+        clearTimeout(markdownRenderTimer);
+        markdownRenderTimer = null;
+      }
       currentTurn = null;
       const errDiv = getOrCreateAssistantDiv();
       errDiv.innerHTML += `<div style="color:#EF4444;font-size:13px;margin-top:8px;">Error: ${escHtml(data.message)}</div>`;
       setStreaming(false);
       break;
+    }
 
-    case 'agent_done':
+    case 'agent_done': {
+      // Flush pending render
+      if (markdownRenderTimer) {
+        clearTimeout(markdownRenderTimer);
+        markdownRenderTimer = null;
+      }
       currentTurn = null;
-      const doneDiv = document.getElementById('active-turn');
-      if (doneDiv) doneDiv.id = 'msg-' + Date.now();
+      const doneDiv2 = document.getElementById('active-turn');
+      if (doneDiv2) doneDiv2.id = 'msg-' + Date.now();
       setStreaming(false);
       break;
+    }
   }
 }
 
@@ -1303,27 +1361,59 @@ function scrollBottom(force = false) {
   });
 }
 
-function addCodeCopyButtons(container) {
+function enhanceCodeBlocks(container) {
+  // Wrap bare <pre> blocks (not already in a wrapper) with header + copy button
   const pres = container.querySelectorAll('pre');
   pres.forEach(pre => {
-    if (pre.querySelector('.code-copy-btn')) return; // Already added
-    const btn = document.createElement('button');
-    btn.className = 'code-copy-btn';
-    btn.textContent = 'Copy';
-    btn.onclick = () => {
-      const code = pre.querySelector('code')?.textContent || pre.textContent;
-      navigator.clipboard.writeText(code).then(() => {
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
+    if (pre.closest('.code-block-wrapper')) return; // Already wrapped
+
+    // Extract language from code class (e.g., "hljs language-python" → "python")
+    const code = pre.querySelector('code');
+    let lang = '';
+    if (code) {
+      const cls = code.className || '';
+      const m = cls.match(/language-(\w+)/);
+      if (m) lang = m[1];
+      if (!lang) {
+        const m2 = cls.match(/lang-(\w+)/);
+        if (m2) lang = m2[1];
+      }
+    }
+
+    // Create wrapper
+    const wrapper = document.createElement('div');
+    wrapper.className = 'code-block-wrapper';
+
+    const header = document.createElement('div');
+    header.className = 'code-block-header';
+    header.innerHTML = `<span class="code-lang-label">${lang || 'code'}</span>`;
+
+    const copyBtn = document.createElement('button');
+    copyBtn.className = 'code-copy-btn';
+    copyBtn.textContent = 'Copy';
+    copyBtn.onclick = () => {
+      const codeText = code?.textContent || pre.textContent;
+      navigator.clipboard.writeText(codeText).then(() => {
+        copyBtn.textContent = 'Copied!';
+        copyBtn.classList.add('copied');
         setTimeout(() => {
-          btn.textContent = 'Copy';
-          btn.classList.remove('copied');
+          copyBtn.textContent = 'Copy';
+          copyBtn.classList.remove('copied');
         }, 2000);
       });
     };
-    pre.appendChild(btn);
+    header.appendChild(copyBtn);
+
+    // Replace pre with wrapper > header + pre
+    pre.parentNode.insertBefore(wrapper, pre);
+    wrapper.appendChild(header);
+    wrapper.appendChild(pre);
   });
 }
+
+// Alias for backward compat
+function addCodeCopyButtons(container) { enhanceCodeBlocks(container); }
+function addCodeLangLabels(container) { /* language labels handled by enhanceCodeBlocks */ }
 
 function copyText(btn) {
   const msg = btn.closest('.msg-assistant');
