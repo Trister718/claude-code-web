@@ -2,6 +2,8 @@
 
 一个完全复刻 [claude.ai](https://claude.ai) 界面风格的本地 Web 聊天客户端，通过 DeepSeek API 代理连接到 Claude Code，完整展示 Thinking 过程、工具调用等中间结果。
 
+![Screenshot](docs/screenshot.png)
+
 ## 功能特性
 
 - 🎨 **1:1 复刻 claude.ai 界面** — 侧边栏、对话列表、明暗主题、完整的 Markdown 渲染
