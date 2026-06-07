@@ -1,0 +1,20 @@
+# API keys and secrets
+.env
+
+# Dependencies
+node_modules/
+
+# Conversation data (personal)
+data/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+nul
