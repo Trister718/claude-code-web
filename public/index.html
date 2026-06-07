@@ -339,24 +339,14 @@ html, body {
 
 /* Code blocks */
 .code-block-wrapper {
+  position: relative;
   margin: 12px 0;
   border-radius: var(--radius-sm);
-  overflow: hidden;
-  border: 1px solid rgba(255,255,255,0.08);
 }
-.code-block-header {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 6px 12px;
-  background: #2A2A2A;
-  font-size: 11px; font-weight: 500;
-  color: #999;
-  font-family: var(--font-sans);
-}
-.code-lang-label { text-transform: lowercase; }
 .code-block-wrapper pre {
   background: var(--code-bg);
-  border-radius: 0;
-  padding: 12px 16px;
+  border-radius: var(--radius-sm);
+  padding: 28px 16px 16px;  /* extra top padding for lang label */
   overflow-x: auto;
   margin: 0;
   font-size: 13px;
@@ -365,6 +355,15 @@ html, body {
 .code-block-wrapper pre code {
   font-family: var(--font-mono);
   color: #E2E8F0;
+}
+.code-lang-label {
+  position: absolute;
+  top: 6px; left: 14px;
+  font-size: 10px; font-weight: 500;
+  color: var(--text-tertiary);
+  font-family: var(--font-sans);
+  letter-spacing: 0.3px;
+  pointer-events: none;
 }
 .msg-assistant-content pre {
   background: var(--code-bg);
@@ -391,11 +390,13 @@ html, body {
 }
 
 .code-copy-btn {
+  position: absolute;
+  top: 6px; right: 10px;
   background: none;
   border: none;
-  color: #999;
+  color: var(--text-tertiary);
   cursor: pointer;
-  font-size: 11px;
+  font-size: 10px;
   padding: 2px 6px;
   border-radius: 3px;
   font-family: var(--font-sans);
@@ -403,7 +404,7 @@ html, body {
   opacity: 0;
 }
 .code-block-wrapper:hover .code-copy-btn { opacity: 1; }
-.code-copy-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.code-copy-btn:hover { background: var(--bg-tertiary); color: var(--text-primary); }
 .code-copy-btn.copied { color: #10B981; }
 
 /* ========== Input Area ========== */
@@ -1362,10 +1363,10 @@ function scrollBottom(force = false) {
 }
 
 function enhanceCodeBlocks(container) {
-  // Wrap bare <pre> blocks (not already in a wrapper) with header + copy button
   const pres = container.querySelectorAll('pre');
   pres.forEach(pre => {
     if (pre.closest('.code-block-wrapper')) return; // Already wrapped
+    if (!pre.parentNode) return; // Safety: not attached to DOM
 
     // Extract language from code class (e.g., "hljs language-python" → "python")
     const code = pre.querySelector('code');
@@ -1380,14 +1381,19 @@ function enhanceCodeBlocks(container) {
       }
     }
 
-    // Create wrapper
+    // Wrap pre in a relative container for positioning
     const wrapper = document.createElement('div');
     wrapper.className = 'code-block-wrapper';
 
-    const header = document.createElement('div');
-    header.className = 'code-block-header';
-    header.innerHTML = `<span class="code-lang-label">${lang || 'code'}</span>`;
+    // Language label (only if detected)
+    if (lang) {
+      const label = document.createElement('span');
+      label.className = 'code-lang-label';
+      label.textContent = lang;
+      wrapper.appendChild(label);
+    }
 
+    // Copy button
     const copyBtn = document.createElement('button');
     copyBtn.className = 'code-copy-btn';
     copyBtn.textContent = 'Copy';
@@ -1402,11 +1408,10 @@ function enhanceCodeBlocks(container) {
         }, 2000);
       });
     };
-    header.appendChild(copyBtn);
+    wrapper.appendChild(copyBtn);
 
-    // Replace pre with wrapper > header + pre
+    // Replace pre with wrapper containing pre
     pre.parentNode.insertBefore(wrapper, pre);
-    wrapper.appendChild(header);
     wrapper.appendChild(pre);
   });
 }
