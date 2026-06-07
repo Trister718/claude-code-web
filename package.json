@@ -2,10 +2,10 @@
   "name": "claude-code-web",
   "version": "1.0.0",
   "description": "Claude.ai style web chat interface with Agent Loop for Claude Code",
-  "main": "server.js",
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js",
-    "setup": "node setup.js"
+    "start": "node src/server.js",
+    "setup": "node src/setup.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.0",

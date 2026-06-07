@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 
 const settingsPath = path.join(process.env.HOME || process.env.USERPROFILE, '.claude', 'settings.json');
-const envPath = path.join(__dirname, '.env');
+const envPath = path.join(__dirname, '..', '.env');
 
 let env = {};
 

@@ -2,14 +2,14 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
-require('dotenv').config();
+require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const { Agent } = require('./agent');
 const { TOOL_DEFINITIONS } = require('./tools');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = path.join(__dirname, '..', 'data');
 const CONV_FILE = path.join(DATA_DIR, 'conversations.json');
 
 // Ensure data directory exists
@@ -18,7 +18,7 @@ if (!fs.existsSync(CONV_FILE)) fs.writeFileSync(CONV_FILE, '[]');
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // Store active agents so we can stop them
 const activeAgents = {};
